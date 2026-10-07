@@ -3,9 +3,11 @@
 
 package com.microsoft.copilot.eclipse.core.completion;
 
+import java.io.IOException;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -22,6 +24,7 @@ import org.eclipse.jface.text.BadLocationException;
 import org.eclipse.jface.text.IDocument;
 import org.eclipse.lsp4e.LSPEclipseUtils;
 import org.eclipse.lsp4j.Position;
+import org.eclipse.lsp4j.Range;
 
 import com.microsoft.copilot.eclipse.core.AuthStatusManager;
 import com.microsoft.copilot.eclipse.core.Constants;
@@ -81,7 +84,7 @@ public class CompletionProvider {
    * @param enableNes whether NES is enabled
    */
   public void triggerCompletion(IFile file, Position position, int documentVersion, boolean enableNes) {
-    if (statusManager.isNotSignedInOrNotAuthorized()) {
+    if (!OllamaCompletionClient.isEnabled() && statusManager.isNotSignedInOrNotAuthorized()) {
       return;
     }
     boolean enableCompletion = !this.usingCodeMining
@@ -138,6 +141,7 @@ public class CompletionProvider {
     private List<CompletionItem> completions;
     private boolean enableCompletion; // whether to request completion
     private boolean enableNes; // whether NES is enabled (for fallback or direct fetch)
+    private final OllamaCompletionClient ollamaClient = new OllamaCompletionClient();
 
     /**
      * Creates a new completion job.
@@ -194,8 +198,13 @@ public class CompletionProvider {
       // If completion is enabled, request completion from LS
       if (this.enableCompletion) {
         try {
-          CompletionResult result = this.lsConnection.getCompletions(params).get(COMPLETION_TIMEOUT_MILLIS,
-              TimeUnit.MILLISECONDS);
+          CompletionResult result;
+          if (OllamaCompletionClient.isEnabled()) {
+            result = new CompletionResult(fetchOllamaCompletions());
+          } else {
+            result = this.lsConnection.getCompletions(params).get(COMPLETION_TIMEOUT_MILLIS,
+                TimeUnit.MILLISECONDS);
+          }
 
           // Check if we should fallback to NES (empty or useless completions)
           if (this.enableNes && file instanceof IFile f && shouldFallbackToNes(result)) {
@@ -223,6 +232,36 @@ public class CompletionProvider {
         return Status.CANCEL_STATUS;
       }
       return Status.OK_STATUS;
+    }
+
+    /**
+     * Asks the local Ollama model for a suggestion at the cursor. Returns an empty list on failure, so that the NES
+     * fallback still applies.
+     */
+    private List<CompletionItem> fetchOllamaCompletions() throws InterruptedException {
+      Position position = params.getDoc().getPosition();
+      IDocument document = LSPEclipseUtils.getDocument(this.file);
+      if (document == null) {
+        return List.of();
+      }
+      try {
+        int offset = LSPEclipseUtils.toOffset(position, document);
+        String prefix = document.get(0, offset);
+        String suffix = document.get(offset, document.getLength() - offset);
+        String suggestion = ollamaClient.complete(prefix, suffix);
+        if (suggestion.isEmpty()) {
+          return List.of();
+        }
+        CompletionItem item = new CompletionItem(UUID.randomUUID().toString(), suggestion,
+            new Range(position, position), suggestion, position, params.getDoc().getVersion());
+        return List.of(item);
+      } catch (BadLocationException e) {
+        CopilotCore.LOGGER.error("Invalid cursor position for Ollama completion", e);
+        return List.of();
+      } catch (IOException e) {
+        CopilotCore.LOGGER.error("Ollama completion request failed", e);
+        return List.of();
+      }
     }
 
     /**
